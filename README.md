@@ -1,127 +1,128 @@
 # Incremental ETL Pipeline
 
-Scheduled batch job that copies production-planning views from an operational
-SQL database into an analytics warehouse every 15 minutes, using a **sliding
-window overwrite** through a staging table, with guards that refuse to load a
-batch that looks broken.
+Job em lote agendado que copia views de planejamento de produção de um banco
+SQL operacional para um data warehouse analítico a cada 15 minutos, usando
+**sobrescrita por janela deslizante** através de uma tabela de staging, com
+travas que se recusam a carregar um lote que pareça quebrado.
 
-> **Public demo version.** Sanitized reimplementation of a pipeline I built
-> (SQL Server → Google BigQuery). Here both ends are local SQLite files filled
-> with synthetic data, so it runs offline with no credentials. See
-> [Mock environment](#mock-environment).
+> **Versão pública de demonstração.** Reimplementação sanitizada de um pipeline
+> que construí (SQL Server → Google BigQuery). Aqui as duas pontas são arquivos
+> SQLite locais preenchidos com dados sintéticos, então tudo roda offline e sem
+> credenciais. Veja [Ambiente simulado](#ambiente-simulado).
 
-## Problem
+## Problema
 
-BI dashboards needed near-real-time order, machine-schedule and reel-queue data
-that lived only in the production planning system's database. The first version
-of the job truncated and reloaded every view on each run; running it every
-15 minutes exposed three issues:
+Os dashboards de BI precisavam de dados quase em tempo real de pedidos,
+programação de máquinas e fila de bobinas, que existiam apenas no banco do
+sistema de planejamento da produção. A primeira versão do job truncava e
+recarregava todas as views a cada execução; rodando a cada 15 minutos, isso
+expôs três problemas:
 
-- reloading the full history on every run is wasteful when only recent orders change;
-- orders keep changing for weeks after creation (status, produced quantity), so
-  a pure append/incremental-by-id load would miss updates;
-- if the source returned an empty or partial result (maintenance, network
-  hiccup, a broken view), the job would happily wipe good data in the warehouse.
+- recarregar todo o histórico a cada execução é desperdício quando só os pedidos recentes mudam;
+- os pedidos continuam mudando por semanas após a criação (status, quantidade
+  produzida), então uma carga apenas incremental por id perderia atualizações;
+- se a origem retornasse um resultado vazio ou parcial (manutenção, instabilidade
+  de rede, view quebrada), o job apagaria sem hesitar dados bons no warehouse.
 
-## Solution
+## Solução
 
-- **Sliding window:** each run re-reads only the last `MESES_JANELA` months
-  (from the 1st day of the month, default 3) and replaces exactly that window in
-  the destination. Small reference views without a date filter are fully reloaded.
-- **Staging + atomic swap:** the batch is first written to `<TABLE>__STG`; then a
-  single transaction runs `DELETE window` + `INSERT … SELECT FROM staging`. If
-  anything fails, the destination keeps its previous state. Staging is emptied afterwards.
-- **Data-loss guards:** abort when the view returns 0 rows, or when the new batch
-  is less than 50 % of the rows currently stored for the same window (checked
-  only above 1,000 rows).
-- **Explicit typing:** every column is declared once with its warehouse type and
-  normalised with pandas (strings trimmed, empty → NULL, numeric coercion,
-  `Decimal` for NUMERIC, timezone stripped from datetimes); a `data_carga`
-  timestamp is appended.
-- **Operational safety:** lock file so overlapping runs exit immediately
-  (stale locks older than 25 min are taken over), up to 3 attempts per view,
-  one failing view does not block the others, rotating log file, exit code ≠ 0
-  on any error (for the scheduler to alert on).
-- `--full` reloads every view entirely (initial load / recovery).
+- **Janela deslizante:** cada execução relê apenas os últimos `MESES_JANELA`
+  meses (a partir do dia 1º do mês, padrão 3) e substitui exatamente essa janela
+  no destino. Views de referência pequenas, sem filtro de data, são recarregadas por completo.
+- **Staging + troca atômica:** o lote é gravado primeiro em `<TABELA>__STG`;
+  depois uma única transação executa `DELETE da janela` + `INSERT … SELECT FROM staging`.
+  Se algo falhar, o destino mantém o estado anterior. A staging é esvaziada ao final.
+- **Travas contra perda de dados:** aborta quando a view retorna 0 linhas, ou
+  quando o novo lote tem menos de 50 % das linhas já gravadas para a mesma janela
+  (verificado apenas acima de 1.000 linhas).
+- **Tipagem explícita:** cada coluna é declarada uma única vez com o seu tipo no
+  warehouse e normalizada com pandas (strings com trim, vazio → NULL, conversão
+  numérica, `Decimal` para NUMERIC, fuso horário removido das datas); é
+  acrescentado um timestamp `data_carga`.
+- **Segurança operacional:** arquivo de lock para que execuções sobrepostas
+  saiam imediatamente (locks abandonados com mais de 25 min são assumidos), até
+  3 tentativas por view, uma view com falha não bloqueia as demais, arquivo de
+  log rotativo, código de saída ≠ 0 em qualquer erro (para o agendador alertar).
+- `--full` recarrega todas as views por completo (carga inicial / recuperação).
 
-## Architecture
+## Arquitetura
 
 ```
-  scheduler (every 15 min)
+  agendador (a cada 15 min)
           │
           ▼
-  run.py ─► carga.main ── lock file ──┐
-                │                     │
-     for each view in config.VIEWS    │
-                │                     │
-     ┌──────────▼──────────┐          │
+  run.py ─► carga.main ── arquivo de lock ──┐
+                │                           │
+     para cada view em config.VIEWS         │
+                │                           │
+     ┌──────────▼──────────┐                │
      │ fonte.ler_view       │  SELECT [cols] FROM [view] WHERE [DataCriacao] >= :corte
      │ (SQLAlchemy)         │
      └──────────┬──────────┘
                 ▼
      transformacao.tratar_tipos  (+ data_carga)
                 │
-     guards: empty batch? volume drop > 50 %?
+     travas: lote vazio? queda de volume > 50 %?
                 │
      ┌──────────▼──────────────────────────────────────┐
      │ armazem                                          │
-     │  window views:  load → <TABLE>__STG              │
-     │                 BEGIN; DELETE window;            │
+     │  views c/ janela: carga → <TABELA>__STG          │
+     │                 BEGIN; DELETE janela;            │
      │                 INSERT … SELECT FROM STG; COMMIT │
      │                 DELETE FROM STG                  │
-     │  full views:    WRITE_TRUNCATE                   │
+     │  views cheias:  WRITE_TRUNCATE                   │
      └──────────────────────────────────────────────────┘
 ```
 
-## Technologies
+## Tecnologias
 
 - **Python 3.11+**, `pandas`, `SQLAlchemy`, `python-dateutil`, `python-dotenv`
-- Original: SQL Server (via `pyodbc`) and Google BigQuery (`google-cloud-bigquery`:
-  load jobs, parameterised queries, multi-statement transactions)
-- This demo: SQLite for both source and warehouse (standard library `sqlite3`)
+- Original: SQL Server (via `pyodbc`) e Google BigQuery (`google-cloud-bigquery`:
+  load jobs, queries parametrizadas, transações com múltiplas instruções)
+- Esta demo: SQLite para origem e warehouse (`sqlite3` da biblioteca padrão)
 - `pytest`
 
-## How it works
+## Como funciona
 
-| Step | Function |
+| Etapa | Função |
 |---|---|
-| acquire lock / exit if another run is active | `obter_trava` |
-| compute window start (`1st day of month − N months`) | `calcular_corte` |
-| read the view (window filter pushed down to the source) | `fonte.ler_view` |
-| normalise types, add `data_carga` | `transformacao.tratar_tipos` |
-| refuse empty batch / large volume drop | `carregar_view`, `conferir_volume` |
-| write staging and swap the window atomically | `sobrescrever_janela`, `trocar_janela` |
-| full reload for views without a window | `carga_cheia` |
-| retry each view, keep going on failure | `carregar_com_retentativa` |
+| obter o lock / sair se outra execução estiver ativa | `obter_trava` |
+| calcular o início da janela (`dia 1º do mês − N meses`) | `calcular_corte` |
+| ler a view (filtro da janela aplicado na origem) | `fonte.ler_view` |
+| normalizar tipos, adicionar `data_carga` | `transformacao.tratar_tipos` |
+| recusar lote vazio / grande queda de volume | `carregar_view`, `conferir_volume` |
+| gravar a staging e trocar a janela de forma atômica | `sobrescrever_janela`, `trocar_janela` |
+| recarga completa para views sem janela | `carga_cheia` |
+| retentar cada view, seguir em frente em caso de falha | `carregar_com_retentativa` |
 
-The job never creates destination tables: they must exist (DDL in
-[`sql/armazem.sql`](sql/armazem.sql)), so a typo in the configuration cannot
-silently create a new empty table.
+O job nunca cria tabelas de destino: elas precisam existir (DDL em
+[`sql/armazem.sql`](sql/armazem.sql)), para que um erro de digitação na
+configuração não crie silenciosamente uma tabela nova e vazia.
 
-## Running locally
+## Executando localmente
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 
-python scripts/preparar_demo.py    # synthetic source (≈5,000 orders) + empty warehouse in data/
-python run.py --full               # initial full load
-python run.py                      # regular 15-minute run (window only)
+python scripts/preparar_demo.py    # origem sintética (≈5.000 pedidos) + warehouse vazio em data/
+python run.py --full               # carga completa inicial
+python run.py                      # execução regular de 15 minutos (somente a janela)
 
-python scripts/preparar_demo.py --atualizar       # new orders + status changes in the source
-python run.py                                     # window replaced, history untouched
+python scripts/preparar_demo.py --atualizar       # novos pedidos + mudanças de status na origem
+python run.py                                     # janela substituída, histórico intacto
 
-python scripts/preparar_demo.py --simular-perda   # ~80 % of recent orders vanish from the source
-python run.py                                     # guard aborts that view, others still load
+python scripts/preparar_demo.py --simular-perda   # ~80 % dos pedidos recentes somem da origem
+python run.py                                     # a trava aborta essa view, as outras carregam normalmente
 
 python -m pytest
 ```
 
-Settings can be overridden in `.env` (see [`.env.example`](.env.example)); logs go
-to `logs/carga.log`.
+As configurações podem ser sobrescritas em `.env` (veja [`.env.example`](.env.example));
+os logs vão para `logs/carga.log`.
 
-## Example
+## Exemplo
 
 ```
 [INFO] === Inicio da carga (janela desde 01/07/2026 00:00) ===
@@ -131,7 +132,7 @@ to `logs/carga.log`.
 [INFO] === Fim da carga em 0.4s (0 erro(s)) ===
 ```
 
-With a partial source:
+Com uma origem parcial:
 
 ```
 [WARNING] [FALHA] vw_ConsultaPedidos (tentativa 1/3): lote com 492 linhas contra 2462 ja gravadas (queda acima de 50%); carga abortada para nao apagar dado bom | nova tentativa em 20s
@@ -139,34 +140,34 @@ With a partial source:
 [INFO] === Fim da carga em 40.6s (1 erro(s)) ===
 ```
 
-## Mock environment
+## Ambiente simulado
 
-| Original | This repository |
+| Original | Este repositório |
 |---|---|
-| SQL Server database of the production planning system (vendor views) | `data/fonte.db` — SQLite with synthetic tables and three views with the same column layout ([`sql/fonte.sql`](sql/fonte.sql)) |
-| Google BigQuery dataset (destination + `__STG` tables) | `data/armazem.db` — SQLite; `ArmazemLocal` exposes the subset of the BigQuery client used by the job (`get_table`, `query`, `load_table_from_dataframe`, transactions) |
-| BigQuery parameters (`@corte`) and `BEGIN/COMMIT TRANSACTION` script | SQLite named parameters (`:corte`) and a Python-managed transaction |
-| Real customers, papers, machines | `Cliente 0001…0120`, generic paper grades, `MAQ-01/02` |
-| Credentials in `.env` | none needed; `FONTE_URL` only accepts `sqlite:///` in this version |
+| Banco SQL Server do sistema de planejamento da produção (views do fornecedor) | `data/fonte.db` — SQLite com tabelas sintéticas e três views com o mesmo layout de colunas ([`sql/fonte.sql`](sql/fonte.sql)) |
+| Dataset do Google BigQuery (tabelas de destino + `__STG`) | `data/armazem.db` — SQLite; `ArmazemLocal` expõe o subconjunto do cliente BigQuery usado pelo job (`get_table`, `query`, `load_table_from_dataframe`, transações) |
+| Parâmetros do BigQuery (`@corte`) e script `BEGIN/COMMIT TRANSACTION` | parâmetros nomeados do SQLite (`:corte`) e transação gerenciada em Python |
+| Clientes, papéis e máquinas reais | `Cliente 0001…0120`, tipos de papel genéricos, `MAQ-01/02` |
+| Credenciais no `.env` | nenhuma necessária; `FONTE_URL` só aceita `sqlite:///` nesta versão |
 
-## Project structure
+## Estrutura do projeto
 
 ```
-run.py                       entry point (python run.py [--full])
+run.py                       ponto de entrada (python run.py [--full])
 src/etl_carga/
-├── config.py                views, destination tables, column types, limits
-├── carga.py                 orchestration: lock, window, guards, retries, logging
-├── fonte.py                 source reader (SQLAlchemy)
-├── armazem.py               local warehouse (BigQuery stand-in)
-└── transformacao.py         type normalisation
-sql/                         DDL for the synthetic source and the warehouse
-scripts/preparar_demo.py     synthetic data generator and scenario simulation
-tests/                       pytest suite
+├── config.py                views, tabelas de destino, tipos de coluna, limites
+├── carga.py                 orquestração: lock, janela, travas, retentativas, logs
+├── fonte.py                 leitor da origem (SQLAlchemy)
+├── armazem.py               warehouse local (substituto do BigQuery)
+└── transformacao.py         normalização de tipos
+sql/                         DDL da origem sintética e do warehouse
+scripts/preparar_demo.py     gerador de dados sintéticos e simulação de cenários
+tests/                       suíte pytest
 ```
 
-## Future improvements
+## Melhorias futuras
 
-- Watermark on a `DataAlteracao` column (when the source offers one) to shrink the window.
-- Data-quality checks per column (null ratio, duplicate keys) next to the volume guard.
-- Emit run metrics (rows, duration, errors) to a monitoring table or dashboard.
-- Orchestrate with Airflow/Prefect instead of the OS scheduler.
+- Watermark em uma coluna `DataAlteracao` (quando a origem oferecer) para reduzir a janela.
+- Verificações de qualidade de dados por coluna (proporção de nulos, chaves duplicadas) junto com a trava de volume.
+- Emitir métricas de execução (linhas, duração, erros) para uma tabela ou dashboard de monitoramento.
+- Orquestrar com Airflow/Prefect em vez do agendador do sistema operacional.
